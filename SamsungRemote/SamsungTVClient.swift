@@ -4,6 +4,7 @@ import Foundation
 final class SamsungTVClient: NSObject, ObservableObject {
     enum Status: Equatable {
         case disconnected
+        case resolving
         case connecting
         case awaitingPairing
         case connected
@@ -12,6 +13,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
         var label: String {
             switch self {
             case .disconnected:     return "Disconnected"
+            case .resolving:        return "Finding TV on network…"
             case .connecting:       return "Connecting…"
             case .awaitingPairing:  return "Waiting for TV pairing…"
             case .connected:        return "Connected"
@@ -25,6 +27,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
     private let settings: AppSettings
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
+    private var connectTask: Task<Void, Never>?
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -37,31 +40,46 @@ final class SamsungTVClient: NSObject, ObservableObject {
     // MARK: - Connection
 
     func connect() {
-        let host = settings.tvHost.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty else {
-            status = .failed("Set the TV host in Settings")
+        connectTask?.cancel()
+        connectTask = Task { [weak self] in
+            await self?.connectAsync()
+        }
+    }
+
+    private func connectAsync() async {
+        guard let initial = settings.activeTV else {
+            status = .failed("No TV selected. Tap Settings → Scan.")
             return
         }
-        disconnect()
 
-        let nameB64 = Data(settings.deviceName.utf8).base64EncodedString()
-        var components = URLComponents()
-        components.scheme = settings.scheme
-        components.host = host
-        components.port = settings.port
-        components.path = "/api/v2/channels/samsung.remote.control"
-        var query = [URLQueryItem(name: "name", value: nameB64)]
-        if let token = settings.token, !token.isEmpty {
-            query.append(URLQueryItem(name: "token", value: token))
+        cancelSocket()
+
+        // 1. Try the stored host. If the TV no longer answers there (common on
+        //    DHCP networks), fall back to a subnet scan and match by MAC/UDN.
+        var tv = initial
+        if !(await TVScanner.isReachable(host: tv.host)) {
+            status = .resolving
+            let matches = await TVScanner.scanSubnet()
+            if let match = matches.first(where: { $0.id == tv.id }) {
+                tv.host = match.host
+                if let modelName = match.modelName { tv.modelName = modelName }
+                settings.update(id: tv.id) {
+                    $0.host = match.host
+                    if let modelName = match.modelName { $0.modelName = modelName }
+                }
+            } else {
+                status = .failed("TV not found on this network.")
+                return
+            }
         }
-        components.queryItems = query
 
-        guard let url = components.url else {
+        guard let url = buildURL(for: tv) else {
             status = .failed("Invalid TV URL")
             return
         }
 
-        status = (settings.token == nil) ? .awaitingPairing : .connecting
+        status = (tv.token == nil) ? .awaitingPairing : .connecting
+
         let ws = session.webSocketTask(with: url)
         self.task = ws
         ws.resume()
@@ -69,9 +87,31 @@ final class SamsungTVClient: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        connectTask?.cancel()
+        connectTask = nil
+        cancelSocket()
+        if case .failed = status { /* preserve error for the user */ }
+        else { status = .disconnected }
+    }
+
+    private func cancelSocket() {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
-        if case .failed = status { /* keep */ } else { status = .disconnected }
+    }
+
+    private func buildURL(for tv: SavedTV) -> URL? {
+        let nameB64 = Data(settings.deviceName.utf8).base64EncodedString()
+        var components = URLComponents()
+        components.scheme = tv.scheme
+        components.host = tv.host
+        components.port = tv.port
+        components.path = "/api/v2/channels/samsung.remote.control"
+        var query = [URLQueryItem(name: "name", value: nameB64)]
+        if let token = tv.token, !token.isEmpty {
+            query.append(URLQueryItem(name: "token", value: token))
+        }
+        components.queryItems = query
+        return components.url
     }
 
     // MARK: - Sending keys
@@ -143,13 +183,16 @@ final class SamsungTVClient: NSObject, ObservableObject {
         case "ms.channel.connect":
             if let payload = json["data"] as? [String: Any],
                let token = payload["token"] as? String,
-               !token.isEmpty {
-                settings.token = token
+               !token.isEmpty,
+               let id = settings.activeTV?.id {
+                settings.update(id: id) { $0.token = token }
             }
             status = .connected
 
         case "ms.channel.unauthorized":
-            settings.token = nil
+            if let id = settings.activeTV?.id {
+                settings.forgetPairing(id: id)
+            }
             status = .failed("Pairing denied on the TV")
 
         case "ms.channel.timeOut":

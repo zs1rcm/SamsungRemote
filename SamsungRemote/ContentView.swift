@@ -62,9 +62,9 @@ struct ContentView: View {
                 .fill(statusColor)
                 .frame(width: 10, height: 10)
             VStack(alignment: .leading, spacing: 2) {
-                Text(client.status.label)
+                Text(primaryLine)
                     .font(.subheadline.weight(.semibold))
-                Text(settings.tvHost.isEmpty ? "No TV configured" : "\(settings.tvHost):\(settings.port)")
+                Text(secondaryLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -80,13 +80,28 @@ struct ContentView: View {
                     .font(.footnote.weight(.semibold))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(Color.accentColor, in: Capsule())
+                    .background(settings.activeTV == nil ? Color.gray : Color.accentColor, in: Capsule())
                     .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
+            .disabled(settings.activeTV == nil)
         }
         .padding(14)
         .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var primaryLine: String {
+        if let tv = settings.activeTV {
+            return tv.displayName
+        }
+        return "No TV selected"
+    }
+
+    private var secondaryLine: String {
+        guard let tv = settings.activeTV else {
+            return "Tap the gear icon → Scan"
+        }
+        return "\(client.status.label) · \(tv.host):\(tv.port)"
     }
 
     private var topRow: some View {
@@ -204,10 +219,10 @@ struct ContentView: View {
 
     private var statusColor: Color {
         switch client.status {
-        case .connected:        return .green
-        case .connecting, .awaitingPairing: return .yellow
-        case .failed:           return .red
-        case .disconnected:     return .gray
+        case .connected:                                 return .green
+        case .connecting, .awaitingPairing, .resolving:  return .yellow
+        case .failed:                                    return .red
+        case .disconnected:                              return .gray
         }
     }
 }
