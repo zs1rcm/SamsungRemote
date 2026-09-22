@@ -23,28 +23,20 @@ Features:
 
 ## Build it in Xcode
 
-1. Open Xcode → **File ▸ New ▸ Project…** → **iOS ▸ App**.
-2. Product Name: `SamsungRemote`, Interface: **SwiftUI**, Language: **Swift**.
-   Pick any bundle ID you like. Minimum deployment: **iOS 16.0** (17 is fine
-   too).
-3. Close Xcode. In Finder, open the project folder Xcode just created (it will
-   contain a `SamsungRemote.xcodeproj` and a `SamsungRemote/` source folder).
-4. Copy every file from this repo's `SamsungRemote/` directory into that
-   `SamsungRemote/` source folder, overwriting `SamsungRemoteApp.swift` and
-   `ContentView.swift`.
-5. Re‑open the `.xcodeproj`. In the Project navigator, right‑click the
-   `SamsungRemote` group → **Add Files to "SamsungRemote"…**, select the newly
-   added `.swift` files, check **Copy items if needed** is **off** and
-   **Add to targets: SamsungRemote** is on.
-6. Select the target → **Info** tab and add:
-   - **Privacy - Local Network Usage Description**
-     (`NSLocalNetworkUsageDescription`): `Used to reach your Samsung TV.`
-   - **App Transport Security Settings** → **Allow Arbitrary Loads** = `YES`
-     (needed because the TV uses a self‑signed certificate on port 8002 and/or
-     unencrypted HTTP on 8001).
-   Alternatively, replace the generated `Info.plist` with the one in this repo.
-7. Build & run on a real iPhone on the same Wi‑Fi as your TV (the Simulator
-   works too, but Local Network permission only exists on device).
+1. Clone the repo and double‑click **`SamsungRemote.xcodeproj`**.
+2. Select the **SamsungRemote** target → **Signing & Capabilities** → set your
+   Apple ID as the Team, and change the bundle identifier to something unique
+   like `com.<yourname>.SamsungRemote` (Xcode will only accept one of each).
+3. Pick your iPhone (or a Simulator) as the run destination and hit **⌘R**.
+
+That's it — no manual file dragging, no Info.plist editing. Minimum
+deployment is iOS 16.0.
+
+### Adding an app icon (optional)
+
+Save a 1024×1024 PNG named `AppIcon.png` and drop it onto the empty
+1024×1024 well in `Assets.xcassets ▸ AppIcon` — Xcode generates every size
+from that one image (single‑size mode).
 
 ## Using it
 
