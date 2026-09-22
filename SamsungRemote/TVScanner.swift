@@ -9,6 +9,7 @@ enum TVScanner {
         var name: String
         var modelName: String?
         var host: String
+        var mac: String?
     }
 
     /// Quick reachability probe. Returns true iff the host answers the Samsung
@@ -70,7 +71,10 @@ enum TVScanner {
         let device = json["device"] as? [String: Any]
         let type = (device?["type"] as? String) ?? ""
         let modelName = device?["modelName"] as? String
-        let mac = device?["wifiMac"] as? String
+        let wifiMAC = device?["wifiMac"] as? String
+        // Some firmwares report the wired NIC's MAC separately.
+        let wiredMAC = device?["mac"] as? String ?? device?["ethernetMac"] as? String
+        let mac = (wifiMAC?.isEmpty == false ? wifiMAC : wiredMAC)?.uppercased()
         let udn = json["id"] as? String
         let name = (device?["name"] as? String)
             ?? (json["name"] as? String)
@@ -85,7 +89,7 @@ enum TVScanner {
         guard looksLikeSamsung else { return nil }
 
         let id = (mac?.isEmpty == false ? mac! : (udn?.isEmpty == false ? udn! : host))
-        return Result(id: id, name: name, modelName: modelName, host: host)
+        return Result(id: id, name: name, modelName: modelName, host: host, mac: mac)
     }
 }
 

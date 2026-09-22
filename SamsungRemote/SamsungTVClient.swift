@@ -4,6 +4,7 @@ import Foundation
 final class SamsungTVClient: NSObject, ObservableObject {
     enum Status: Equatable {
         case disconnected
+        case waking
         case resolving
         case connecting
         case awaitingPairing
@@ -14,6 +15,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
         var label: String {
             switch self {
             case .disconnected:     return "Disconnected"
+            case .waking:           return "Waking TV…"
             case .resolving:        return "Finding TV on network…"
             case .connecting:       return "Connecting…"
             case .awaitingPairing:  return "Waiting for TV pairing…"
@@ -36,13 +38,15 @@ final class SamsungTVClient: NSObject, ObservableObject {
     /// the TV sends `ms.channel.connect`.
     private var pendingKeys: [String] = []
 
-    /// Whether the current session should try to come back automatically when
-    /// the socket drops. Set true by `connect()`, false by `disconnect()`.
     private var wantsConnection = false
-
     private var reconnectAttempt = 0
     private let maxReconnectAttempts = 5
     private let pingInterval: UInt64 = 20_000_000_000 // 20 s
+
+    /// How long we're willing to wait for a WoL'd TV to come back up before
+    /// falling back to the subnet scan (or reporting failure).
+    private let wakePollAttempts = 20
+    private let wakePollInterval: UInt64 = 1_000_000_000 // 1 s
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -73,11 +77,17 @@ final class SamsungTVClient: NSObject, ObservableObject {
         else { status = .disconnected }
     }
 
+    /// Fire-and-forget wake for the active TV. Does not attempt to connect
+    /// afterwards.
+    @discardableResult
+    func wakeActive() -> Bool {
+        guard let mac = settings.activeTV?.effectiveMAC else { return false }
+        return WakeOnLAN.wake(mac: mac)
+    }
+
     func send(_ key: TVKey) { send(rawKey: key.rawValue) }
 
     func send(rawKey: String) {
-        // If we're not live, queue the key and (re)connect. Button presses
-        // stay reliable across idle drops.
         if status != .connected || task?.state != .running {
             pendingKeys.append(rawKey)
             if !wantsConnection || connectTask == nil {
@@ -110,18 +120,39 @@ final class SamsungTVClient: NSObject, ObservableObject {
         pingTask?.cancel()
 
         var tv = initial
+
+        // 1. If the stored host doesn't answer, try Wake-on-LAN (if we know
+        //    the MAC) then poll for the TV to appear on the same IP.
+        if !(await TVScanner.isReachable(host: tv.host)) {
+            if let mac = tv.effectiveMAC {
+                status = .waking
+                WakeOnLAN.wake(mac: mac)
+                if await pollReachable(host: tv.host) {
+                    // TV came back up on the same address.
+                } else if Task.isCancelled {
+                    return
+                }
+            }
+        }
+
+        // 2. Still not reachable → maybe the DHCP lease moved. Rescan and
+        //    match by MAC/UDN.
         if !(await TVScanner.isReachable(host: tv.host)) {
             status = .resolving
             let matches = await TVScanner.scanSubnet()
-            if let match = matches.first(where: { $0.id == tv.id }) {
+            if let match = matches.first(where: { $0.id == tv.id })
+                ?? matches.first(where: { tv.effectiveMAC != nil && $0.mac?.uppercased() == tv.effectiveMAC })
+            {
                 tv.host = match.host
                 if let modelName = match.modelName { tv.modelName = modelName }
+                if let mac = match.mac { tv.mac = mac }
                 settings.update(id: tv.id) {
                     $0.host = match.host
                     if let modelName = match.modelName { $0.modelName = modelName }
+                    if let mac = match.mac { $0.mac = mac }
                 }
             } else {
-                scheduleReconnectOrFail("TV not found on this network.")
+                scheduleReconnectOrFail("TV not reachable. Power it on or check Wi-Fi.")
                 return
             }
         }
@@ -141,6 +172,19 @@ final class SamsungTVClient: NSObject, ObservableObject {
         self.task = ws
         ws.resume()
         receiveNext()
+    }
+
+    /// Polls the given host for reachability up to `wakePollAttempts` times.
+    /// Returns true as soon as it answers, false if the poll runs out.
+    private func pollReachable(host: String) async -> Bool {
+        for _ in 0..<wakePollAttempts {
+            if Task.isCancelled { return false }
+            try? await Task.sleep(nanoseconds: wakePollInterval)
+            if await TVScanner.isReachable(host: host, timeout: 0.8) {
+                return true
+            }
+        }
+        return false
     }
 
     private func scheduleReconnectOrFail(_ message: String) {
@@ -205,8 +249,6 @@ final class SamsungTVClient: NSObject, ObservableObject {
             guard let error else { return }
             Task { @MainActor in
                 guard let self else { return }
-                // Socket died between our check and the send — queue and
-                // reconnect so the button press still lands.
                 self.pendingKeys.append(rawKey)
                 self.socketDied(reason: error.localizedDescription)
             }
@@ -298,8 +340,6 @@ final class SamsungTVClient: NSObject, ObservableObject {
             flushPending()
 
         case "ms.channel.unauthorized":
-            // TV explicitly refused this device — clear the token so the
-            // user gets a fresh pairing prompt next time.
             if let id = settings.activeTV?.id {
                 settings.forgetPairing(id: id)
             }
@@ -315,9 +355,6 @@ final class SamsungTVClient: NSObject, ObservableObject {
         }
     }
 
-    /// Samsung firmwares are inconsistent — the token comes back as either a
-    /// JSON string or a JSON number. Accept both, and treat "0"/empty as
-    /// "no token issued yet".
     private func extractToken(from payload: [String: Any]) -> String? {
         let raw = payload["token"]
         var candidate: String?
@@ -334,7 +371,6 @@ final class SamsungTVClient: NSObject, ObservableObject {
 }
 
 extension SamsungTVClient: URLSessionDelegate {
-    // Samsung Tizen TVs present a self-signed cert on port 8002.
     nonisolated func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,

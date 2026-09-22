@@ -68,10 +68,15 @@ On the TV: **Settings ▸ General ▸ Network ▸ Network Status ▸ IP Settings
   the TV (some routers isolate the "guest" and 5 GHz networks). On first scan
   iOS will prompt for Local Network permission; if you denied it, re‑enable it
   in Settings ▸ Samsung Remote ▸ Local Network.
-- **"Connection refused"** — TV is off or on standby, or you're on a different
-  network. Samsungs power down the remote service in deep sleep; Wake‑on‑LAN
-  is required to boot them cold (not implemented here — `KEY_POWER` only works
-  on a reachable TV).
+- **Connect while the TV is off** — the app sends a Wake‑on‑LAN magic packet
+  and polls for up to 20 s for the TV to come back before giving up. For this
+  to work, on the TV:
+  1. **Settings ▸ General ▸ Network ▸ Expert Settings ▸ Power On with Mobile**
+     — turn it **On**.
+  2. Prefer **Ethernet**: most Samsungs power down the Wi‑Fi radio in deep
+     standby, so WoL over Wi‑Fi is unreliable.
+  You can also wake a TV manually from Settings — swipe left on the TV in
+  "My TVs" and tap **Wake**.
 - **Pairing prompt never appears** — older (pre‑2016) TVs use a different
   protocol and are not supported.
 - **TLS errors** — turn TLS off on the saved TV (via Add TV by IP…) to use

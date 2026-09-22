@@ -82,6 +82,13 @@ struct SettingsView: View {
                             } label: { Label("Forget", systemImage: "key.slash") }
                             .tint(.orange)
                         }
+
+                        if let mac = tv.effectiveMAC {
+                            Button {
+                                WakeOnLAN.wake(mac: mac)
+                            } label: { Label("Wake", systemImage: "power") }
+                            .tint(.blue)
+                        }
                     }
                 }
             }
@@ -120,6 +127,7 @@ struct SettingsView: View {
                         name: result.name,
                         modelName: result.modelName,
                         host: result.host,
+                        mac: result.mac,
                         useTLS: true,
                         token: nil
                     )
@@ -175,6 +183,9 @@ struct SettingsView: View {
     private var aboutSection: some View {
         Section("About") {
             Text("Samsung Tizen TVs (2016+) expose a WebSocket remote on ports 8001 (ws) and 8002 (wss). On first connect the TV shows a pairing prompt — accept it and the returned token is stored for future reconnects.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Wake-on-LAN sends a magic packet to the TV's MAC address. It only works if the TV is wired via Ethernet (Samsungs power down Wi-Fi in deep standby) and \"Power On with Mobile\" is enabled on the TV: Settings ▸ General ▸ Network ▸ Expert Settings.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -254,6 +265,7 @@ private struct ManualAddTVView: View {
                 name: nickname.isEmpty ? probed.name : nickname,
                 modelName: probed.modelName,
                 host: probed.host,
+                mac: probed.mac,
                 useTLS: useTLS,
                 token: nil
             )
@@ -265,11 +277,12 @@ private struct ManualAddTVView: View {
                 name: nickname.isEmpty ? trimmed : nickname,
                 modelName: nil,
                 host: trimmed,
+                mac: nil,
                 useTLS: useTLS,
                 token: nil
             )
             settings.upsert(tv, makeActive: true)
-            message = "Couldn't reach the TV right now — saved anyway. Turn the TV on and press Connect."
+            message = "Couldn't reach the TV right now — saved anyway. Turn the TV on and press Connect, or tap Scan later to pick up its MAC address for Wake-on-LAN."
         }
     }
 }

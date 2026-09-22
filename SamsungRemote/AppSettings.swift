@@ -54,6 +54,7 @@ final class AppSettings: ObservableObject {
                 name: host,
                 modelName: nil,
                 host: host,
+                mac: nil,
                 useTLS: tls,
                 token: token
             )
@@ -86,6 +87,7 @@ final class AppSettings: ObservableObject {
         if let existing = savedTVs.first(where: { $0.id == tv.id }) {
             if merged.token == nil { merged.token = existing.token }
             if merged.modelName == nil { merged.modelName = existing.modelName }
+            if merged.mac == nil { merged.mac = existing.mac }
         }
         if let idx = savedTVs.firstIndex(where: { $0.id == tv.id }) {
             savedTVs[idx] = merged
