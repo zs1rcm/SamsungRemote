@@ -8,6 +8,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
         case connecting
         case awaitingPairing
         case connected
+        case reconnecting
         case failed(String)
 
         var label: String {
@@ -17,6 +18,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
             case .connecting:       return "Connecting…"
             case .awaitingPairing:  return "Waiting for TV pairing…"
             case .connected:        return "Connected"
+            case .reconnecting:     return "Reconnecting…"
             case .failed(let msg):  return "Error: \(msg)"
             }
         }
@@ -28,6 +30,19 @@ final class SamsungTVClient: NSObject, ObservableObject {
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
     private var connectTask: Task<Void, Never>?
+    private var pingTask: Task<Void, Never>?
+
+    /// Keys queued while the socket is being (re-)established. Flushed once
+    /// the TV sends `ms.channel.connect`.
+    private var pendingKeys: [String] = []
+
+    /// Whether the current session should try to come back automatically when
+    /// the socket drops. Set true by `connect()`, false by `disconnect()`.
+    private var wantsConnection = false
+
+    private var reconnectAttempt = 0
+    private let maxReconnectAttempts = 5
+    private let pingInterval: UInt64 = 20_000_000_000 // 20 s
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -37,9 +52,47 @@ final class SamsungTVClient: NSObject, ObservableObject {
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }
 
-    // MARK: - Connection
+    // MARK: - Public API
 
     func connect() {
+        wantsConnection = true
+        reconnectAttempt = 0
+        startConnect()
+    }
+
+    func disconnect() {
+        wantsConnection = false
+        reconnectAttempt = 0
+        pendingKeys.removeAll()
+        connectTask?.cancel()
+        connectTask = nil
+        pingTask?.cancel()
+        pingTask = nil
+        cancelSocket()
+        if case .failed = status { /* keep error visible */ }
+        else { status = .disconnected }
+    }
+
+    func send(_ key: TVKey) { send(rawKey: key.rawValue) }
+
+    func send(rawKey: String) {
+        // If we're not live, queue the key and (re)connect. Button presses
+        // stay reliable across idle drops.
+        if status != .connected || task?.state != .running {
+            pendingKeys.append(rawKey)
+            if !wantsConnection || connectTask == nil {
+                connect()
+            } else if status == .disconnected {
+                startConnect()
+            }
+            return
+        }
+        deliver(rawKey: rawKey)
+    }
+
+    // MARK: - Connect
+
+    private func startConnect() {
         connectTask?.cancel()
         connectTask = Task { [weak self] in
             await self?.connectAsync()
@@ -49,13 +102,13 @@ final class SamsungTVClient: NSObject, ObservableObject {
     private func connectAsync() async {
         guard let initial = settings.activeTV else {
             status = .failed("No TV selected. Tap Settings → Scan.")
+            wantsConnection = false
             return
         }
 
         cancelSocket()
+        pingTask?.cancel()
 
-        // 1. Try the stored host. If the TV no longer answers there (common on
-        //    DHCP networks), fall back to a subnet scan and match by MAC/UDN.
         var tv = initial
         if !(await TVScanner.isReachable(host: tv.host)) {
             status = .resolving
@@ -68,7 +121,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
                     if let modelName = match.modelName { $0.modelName = modelName }
                 }
             } else {
-                status = .failed("TV not found on this network.")
+                scheduleReconnectOrFail("TV not found on this network.")
                 return
             }
         }
@@ -78,7 +131,11 @@ final class SamsungTVClient: NSObject, ObservableObject {
             return
         }
 
-        status = (tv.token == nil) ? .awaitingPairing : .connecting
+        if reconnectAttempt > 0 {
+            status = .reconnecting
+        } else {
+            status = (tv.token == nil) ? .awaitingPairing : .connecting
+        }
 
         let ws = session.webSocketTask(with: url)
         self.task = ws
@@ -86,12 +143,20 @@ final class SamsungTVClient: NSObject, ObservableObject {
         receiveNext()
     }
 
-    func disconnect() {
+    private func scheduleReconnectOrFail(_ message: String) {
+        guard wantsConnection, reconnectAttempt < maxReconnectAttempts else {
+            status = .failed(message)
+            wantsConnection = false
+            return
+        }
+        reconnectAttempt += 1
+        let delayNS = UInt64(pow(2.0, Double(reconnectAttempt - 1)) * 1_000_000_000)
+        status = .reconnecting
         connectTask?.cancel()
-        connectTask = nil
-        cancelSocket()
-        if case .failed = status { /* preserve error for the user */ }
-        else { status = .disconnected }
+        connectTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delayNS)
+            await self?.connectAsync()
+        }
     }
 
     private func cancelSocket() {
@@ -114,15 +179,12 @@ final class SamsungTVClient: NSObject, ObservableObject {
         return components.url
     }
 
-    // MARK: - Sending keys
+    // MARK: - Send
 
-    func send(_ key: TVKey) {
-        send(rawKey: key.rawValue)
-    }
-
-    func send(rawKey: String) {
-        guard let task else {
-            status = .failed("Not connected")
+    private func deliver(rawKey: String) {
+        guard let task, task.state == .running else {
+            pendingKeys.append(rawKey)
+            startConnect()
             return
         }
         let payload: [String: Any] = [
@@ -142,12 +204,22 @@ final class SamsungTVClient: NSObject, ObservableObject {
         task.send(.string(text)) { [weak self] error in
             guard let error else { return }
             Task { @MainActor in
-                self?.status = .failed(error.localizedDescription)
+                guard let self else { return }
+                // Socket died between our check and the send — queue and
+                // reconnect so the button press still lands.
+                self.pendingKeys.append(rawKey)
+                self.socketDied(reason: error.localizedDescription)
             }
         }
     }
 
-    // MARK: - Receiving
+    private func flushPending() {
+        let keys = pendingKeys
+        pendingKeys.removeAll()
+        for key in keys { deliver(rawKey: key) }
+    }
+
+    // MARK: - Receive + keepalive
 
     private func receiveNext() {
         task?.receive { [weak self] result in
@@ -155,7 +227,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
                 guard let self else { return }
                 switch result {
                 case .failure(let error):
-                    self.status = .failed(error.localizedDescription)
+                    self.socketDied(reason: error.localizedDescription)
                 case .success(let message):
                     self.handle(message)
                     self.receiveNext()
@@ -163,6 +235,40 @@ final class SamsungTVClient: NSObject, ObservableObject {
             }
         }
     }
+
+    private func startPingLoop() {
+        pingTask?.cancel()
+        pingTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: self.pingInterval)
+                if Task.isCancelled { return }
+                await self.sendPing()
+            }
+        }
+    }
+
+    private func sendPing() async {
+        guard let task, task.state == .running else { return }
+        task.sendPing { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.socketDied(reason: "Keepalive failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func socketDied(reason: String) {
+        cancelSocket()
+        pingTask?.cancel()
+        if wantsConnection {
+            scheduleReconnectOrFail(reason)
+        } else {
+            status = .disconnected
+        }
+    }
+
+    // MARK: - TV protocol
 
     private func handle(_ message: URLSessionWebSocketTask.Message) {
         let text: String? = {
@@ -182,25 +288,48 @@ final class SamsungTVClient: NSObject, ObservableObject {
         switch event {
         case "ms.channel.connect":
             if let payload = json["data"] as? [String: Any],
-               let token = payload["token"] as? String,
-               !token.isEmpty,
+               let token = extractToken(from: payload),
                let id = settings.activeTV?.id {
                 settings.update(id: id) { $0.token = token }
             }
             status = .connected
+            reconnectAttempt = 0
+            startPingLoop()
+            flushPending()
 
         case "ms.channel.unauthorized":
+            // TV explicitly refused this device — clear the token so the
+            // user gets a fresh pairing prompt next time.
             if let id = settings.activeTV?.id {
                 settings.forgetPairing(id: id)
             }
-            status = .failed("Pairing denied on the TV")
+            wantsConnection = false
+            status = .failed("TV refused pairing. Try Connect again to re-pair.")
 
         case "ms.channel.timeOut":
-            status = .failed("Pairing timed out")
+            status = .failed("Pairing timed out. Try Connect again.")
+            wantsConnection = false
 
         default:
             break
         }
+    }
+
+    /// Samsung firmwares are inconsistent — the token comes back as either a
+    /// JSON string or a JSON number. Accept both, and treat "0"/empty as
+    /// "no token issued yet".
+    private func extractToken(from payload: [String: Any]) -> String? {
+        let raw = payload["token"]
+        var candidate: String?
+        if let s = raw as? String {
+            candidate = s
+        } else if let n = raw as? NSNumber {
+            candidate = n.stringValue
+        }
+        guard let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty, value != "0"
+        else { return nil }
+        return value
     }
 }
 

@@ -219,10 +219,10 @@ struct ContentView: View {
 
     private var statusColor: Color {
         switch client.status {
-        case .connected:                                 return .green
-        case .connecting, .awaitingPairing, .resolving:  return .yellow
-        case .failed:                                    return .red
-        case .disconnected:                              return .gray
+        case .connected:                                                 return .green
+        case .connecting, .awaitingPairing, .resolving, .reconnecting:   return .yellow
+        case .failed:                                                    return .red
+        case .disconnected:                                              return .gray
         }
     }
 }
