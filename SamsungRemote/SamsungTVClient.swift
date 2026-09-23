@@ -119,30 +119,33 @@ final class SamsungTVClient: NSObject, ObservableObject {
         cancelSocket()
         pingTask?.cancel()
 
+        DiagnosticLog.shared.log(
+            "Connect attempt for \(initial.displayName) at \(initial.host):\(initial.port); token=\(initial.token == nil ? "none" : "\(initial.token!.prefix(4))••••"); mac=\(initial.effectiveMAC ?? "unknown")"
+        )
+
         var tv = initial
 
-        // 1. If the stored host doesn't answer, try Wake-on-LAN (if we know
-        //    the MAC) then poll for the TV to appear on the same IP.
         if !(await TVScanner.isReachable(host: tv.host)) {
             if let mac = tv.effectiveMAC {
                 status = .waking
+                DiagnosticLog.shared.log("Host unreachable; sending WoL to \(mac)")
                 WakeOnLAN.wake(mac: mac)
                 if await pollReachable(host: tv.host) {
-                    // TV came back up on the same address.
+                    DiagnosticLog.shared.log("TV woke on same IP")
                 } else if Task.isCancelled {
                     return
                 }
             }
         }
 
-        // 2. Still not reachable → maybe the DHCP lease moved. Rescan and
-        //    match by MAC/UDN.
         if !(await TVScanner.isReachable(host: tv.host)) {
             status = .resolving
+            DiagnosticLog.shared.log("Rescanning subnet to find TV by MAC")
             let matches = await TVScanner.scanSubnet()
             if let match = matches.first(where: { $0.id == tv.id })
                 ?? matches.first(where: { tv.effectiveMAC != nil && $0.mac?.uppercased() == tv.effectiveMAC })
             {
+                DiagnosticLog.shared.log("Found TV at \(match.host) (was \(tv.host))")
                 tv.host = match.host
                 if let modelName = match.modelName { tv.modelName = modelName }
                 if let mac = match.mac { tv.mac = mac }
@@ -220,7 +223,13 @@ final class SamsungTVClient: NSObject, ObservableObject {
             query.append(URLQueryItem(name: "token", value: token))
         }
         components.queryItems = query
-        return components.url
+        let url = components.url
+        if let url {
+            let redacted = url.absoluteString
+                .replacingOccurrences(of: (tv.token ?? ""), with: "•••")
+            DiagnosticLog.shared.log("URL: \(redacted) (name=\(settings.deviceName))")
+        }
+        return url
     }
 
     // MARK: - Send
@@ -301,6 +310,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
     }
 
     private func socketDied(reason: String) {
+        DiagnosticLog.shared.log("Socket died: \(reason)", level: .warn)
         cancelSocket()
         pingTask?.cancel()
         if wantsConnection {
@@ -320,24 +330,44 @@ final class SamsungTVClient: NSObject, ObservableObject {
             @unknown default:    return nil
             }
         }()
+        guard let text else { return }
+        DiagnosticLog.shared.log("← \(text.prefix(400))", level: .event)
+
         guard
-            let text,
             let data = text.data(using: .utf8),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let event = json["event"] as? String
         else { return }
 
+        // Some firmwares embed the payload as a JSON-encoded string rather
+        // than a nested object. Normalise both shapes into a dict.
+        let payload = normalisedData(from: json["data"])
+
+        // Try to capture a token from ANY event, not just ms.channel.connect,
+        // because certain Samsungs deliver it in ms.channel.registered or
+        // similar.
+        if let payload, let token = extractToken(from: payload) {
+            if let activeID = settings.activeTV?.id {
+                let previous = settings.activeTV?.token
+                settings.update(id: activeID) { $0.token = token }
+                UserDefaults.standard.synchronize()
+                if previous != token {
+                    DiagnosticLog.shared.log("Token saved for \(activeID.prefix(20)): \(token.prefix(4))••••")
+                } else {
+                    DiagnosticLog.shared.log("Token re-confirmed (unchanged)")
+                }
+            } else {
+                DiagnosticLog.shared.log("Got token but no active TV to save it against", level: .warn)
+            }
+        }
+
         switch event {
         case "ms.channel.connect":
-            if let payload = json["data"] as? [String: Any],
-               let token = extractToken(from: payload),
-               let id = settings.activeTV?.id {
-                settings.update(id: id) { $0.token = token }
-            }
             status = .connected
             reconnectAttempt = 0
             startPingLoop()
             flushPending()
+            DiagnosticLog.shared.log("Connected. Pending keys queued: \(pendingKeys.count)")
 
         case "ms.channel.unauthorized":
             if let id = settings.activeTV?.id {
@@ -345,14 +375,26 @@ final class SamsungTVClient: NSObject, ObservableObject {
             }
             wantsConnection = false
             status = .failed("TV refused pairing. Try Connect again to re-pair.")
+            DiagnosticLog.shared.log("ms.channel.unauthorized — token cleared", level: .warn)
 
         case "ms.channel.timeOut":
             status = .failed("Pairing timed out. Try Connect again.")
             wantsConnection = false
+            DiagnosticLog.shared.log("ms.channel.timeOut", level: .warn)
 
         default:
             break
         }
+    }
+
+    private func normalisedData(from raw: Any?) -> [String: Any]? {
+        if let dict = raw as? [String: Any] { return dict }
+        if let string = raw as? String,
+           let data = string.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return dict
+        }
+        return nil
     }
 
     private func extractToken(from payload: [String: Any]) -> String? {
@@ -364,7 +406,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
             candidate = n.stringValue
         }
         guard let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty, value != "0"
+              !value.isEmpty, value != "0", value.lowercased() != "null"
         else { return nil }
         return value
     }

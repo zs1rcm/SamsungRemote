@@ -16,6 +16,7 @@ struct SettingsView: View {
                 discoverySection
                 manualSection
                 deviceSection
+                diagnosticsSection
                 aboutSection
             }
             .navigationTitle("Settings")
@@ -180,6 +181,19 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var diagnosticsSection: some View {
+        Section {
+            NavigationLink {
+                DiagnosticLogView()
+            } label: {
+                Label("Connection log", systemImage: "text.viewfinder")
+            }
+        } footer: {
+            Text("Open this if the TV re-prompts to allow the remote. It shows every message from the TV so you can see whether the pairing token was actually sent back.")
+        }
+    }
+
+    @ViewBuilder
     private var aboutSection: some View {
         Section("About") {
             Text("Samsung Tizen TVs (2016+) expose a WebSocket remote on ports 8001 (ws) and 8002 (wss). On first connect the TV shows a pairing prompt — accept it and the returned token is stored for future reconnects.")
@@ -194,6 +208,47 @@ struct SettingsView: View {
     private func commitDeviceName() {
         let trimmed = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.deviceName = trimmed.isEmpty ? "iPhone Remote" : trimmed
+    }
+}
+
+// MARK: - Diagnostic log viewer
+
+private struct DiagnosticLogView: View {
+    @ObservedObject private var log = DiagnosticLog.shared
+
+    var body: some View {
+        List {
+            if log.entries.isEmpty {
+                Text("No events yet. Tap Connect on the main screen to start logging.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(log.entries.reversed()) { entry in
+                    Text(log.formatted(entry))
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .foregroundStyle(color(for: entry.level))
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                }
+            }
+        }
+        .navigationTitle("Connection log")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Clear") { log.clear() }
+                    .disabled(log.entries.isEmpty)
+            }
+        }
+    }
+
+    private func color(for level: DiagnosticLog.Level) -> Color {
+        switch level {
+        case .info:  return .primary
+        case .event: return .blue
+        case .warn:  return .orange
+        case .error: return .red
+        }
     }
 }
 
