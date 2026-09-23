@@ -81,3 +81,14 @@ On the TV: **Settings ▸ General ▸ Network ▸ Network Status ▸ IP Settings
   protocol and are not supported.
 - **TLS errors** — turn TLS off on the saved TV (via Add TV by IP…) to use
   port 8001; the app already trusts self‑signed certs on 8002.
+- **TV re‑prompts to Allow the remote after every TV reboot** — this is a
+  Samsung Tizen firmware behaviour, not an app bug. The TV stores its
+  paired‑client whitelist in a partition that gets wiped by a cold boot
+  (unplug, firmware update, and on some 2020+ sets a deep‑standby cycle).
+  On reconnect the TV no longer recognises our stored token and shows the
+  pairing prompt exactly once; after you accept, the new token is captured
+  and everything is fine until the next reboot. Two things that reduce how
+  often this happens in practice: pair the TV with Samsung's own
+  **SmartThings** app first (keeps the whitelist "warm"), and update the TV
+  firmware (Settings ▸ Support ▸ Software Update). Between reboots the app
+  reconnects silently.

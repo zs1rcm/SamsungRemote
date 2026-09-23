@@ -370,12 +370,24 @@ final class SamsungTVClient: NSObject, ObservableObject {
             DiagnosticLog.shared.log("Connected. Pending keys queued: \(pendingKeys.count)")
 
         case "ms.channel.unauthorized":
+            // Common cause: the TV rebooted (firmware update, power blip,
+            // deep-standby cycle) and its side of the pairing store was
+            // wiped, so our stored token is no longer recognised. Clear
+            // the token and immediately reconnect without it — the TV will
+            // show one Allow prompt, and after the user accepts the new
+            // token flows in via ms.channel.connect and is saved.
             if let id = settings.activeTV?.id {
                 settings.forgetPairing(id: id)
+                UserDefaults.standard.synchronize()
             }
-            wantsConnection = false
-            status = .failed("TV refused pairing. Try Connect again to re-pair.")
-            DiagnosticLog.shared.log("ms.channel.unauthorized — token cleared", level: .warn)
+            DiagnosticLog.shared.log(
+                "ms.channel.unauthorized — token cleared, requesting fresh pair",
+                level: .warn
+            )
+            cancelSocket()
+            pingTask?.cancel()
+            status = .awaitingPairing
+            startConnect()
 
         case "ms.channel.timeOut":
             status = .failed("Pairing timed out. Try Connect again.")
