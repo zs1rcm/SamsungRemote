@@ -305,10 +305,10 @@ final class SamsungTVClient: NSObject, ObservableObject {
             let text = String(data: data, encoding: .utf8)
         else { return }
 
-        task.send(.string(text)) { [weak self] error in
+        task.send(.string(text)) { [weak self, weak task] error in
             guard let error else { return }
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.isCurrent(task) else { return }
                 self.pendingKeys.append(rawKey)
                 self.socketDied(reason: error.localizedDescription)
             }
@@ -324,9 +324,15 @@ final class SamsungTVClient: NSObject, ObservableObject {
     // MARK: - Receive + keepalive
 
     private func receiveNext() {
-        task?.receive { [weak self] result in
+        guard let ws = task else { return }
+        ws.receive { [weak self, weak ws] result in
             Task { @MainActor in
-                guard let self else { return }
+                // A socket we've already discarded (after an unauthorized
+                // reply, a reconnect, or Disconnect) still completes its
+                // pending receive, usually with a "cancelled" error. Acting
+                // on that would trigger a second reconnect on top of the one
+                // already scheduled and overwrite the status we just set.
+                guard let self, self.isCurrent(ws) else { return }
                 switch result {
                 case .failure(let error):
                     self.socketDied(reason: error.localizedDescription)
@@ -352,12 +358,20 @@ final class SamsungTVClient: NSObject, ObservableObject {
 
     private func sendPing() async {
         guard let task, task.state == .running else { return }
-        task.sendPing { [weak self] error in
+        task.sendPing { [weak self, weak task] error in
             guard let error else { return }
             Task { @MainActor in
-                self?.socketDied(reason: "Keepalive failed: \(error.localizedDescription)")
+                guard let self, self.isCurrent(task) else { return }
+                self.socketDied(reason: "Keepalive failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// True iff `candidate` is the socket we are currently using. Callbacks
+    /// from any other socket are stale and must be ignored.
+    private func isCurrent(_ candidate: URLSessionWebSocketTask?) -> Bool {
+        guard let candidate, let task else { return false }
+        return candidate === task
     }
 
     private func socketDied(reason: String) {
