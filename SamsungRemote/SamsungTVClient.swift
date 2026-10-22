@@ -48,6 +48,20 @@ final class SamsungTVClient: NSObject, ObservableObject {
     private let wakePollAttempts = 20
     private let wakePollInterval: UInt64 = 1_000_000_000 // 1 s
 
+    /// After a wake, how long we're willing to wait for the TV to report
+    /// `PowerState == "on"` before opening the socket, and the grace period
+    /// we add on top so the remote-control service has loaded its paired
+    /// device list. Connecting mid-boot is the usual reason a perfectly good
+    /// token gets answered with `ms.channel.unauthorized`.
+    private let bootPollAttempts = 20
+    private let bootGraceNS: UInt64 = 3_000_000_000 // 3 s
+
+    /// Consecutive `ms.channel.unauthorized` replies received while we still
+    /// hold a token. The token is only discarded (forcing a new Allow prompt
+    /// on the TV) once this reaches `maxUnauthorizedRetriesWithToken`.
+    private var unauthorizedWithTokenCount = 0
+    private let maxUnauthorizedRetriesWithToken = 3
+
     init(settings: AppSettings) {
         self.settings = settings
         super.init()
@@ -61,12 +75,14 @@ final class SamsungTVClient: NSObject, ObservableObject {
     func connect() {
         wantsConnection = true
         reconnectAttempt = 0
+        unauthorizedWithTokenCount = 0
         startConnect()
     }
 
     func disconnect() {
         wantsConnection = false
         reconnectAttempt = 0
+        unauthorizedWithTokenCount = 0
         pendingKeys.removeAll()
         connectTask?.cancel()
         connectTask = nil
@@ -124,12 +140,14 @@ final class SamsungTVClient: NSObject, ObservableObject {
         )
 
         var tv = initial
+        var sentWake = false
 
         if !(await TVScanner.isReachable(host: tv.host)) {
             if let mac = tv.effectiveMAC {
                 status = .waking
                 DiagnosticLog.shared.log("Host unreachable; sending WoL to \(mac)")
                 WakeOnLAN.wake(mac: mac)
+                sentWake = true
                 if await pollReachable(host: tv.host) {
                     DiagnosticLog.shared.log("TV woke on same IP")
                 } else if Task.isCancelled {
@@ -160,6 +178,12 @@ final class SamsungTVClient: NSObject, ObservableObject {
             }
         }
 
+        if sentWake {
+            status = .waking
+            await waitForBootToSettle(host: tv.host)
+            if Task.isCancelled { return }
+        }
+
         guard let url = buildURL(for: tv) else {
             status = .failed("Invalid TV URL")
             return
@@ -188,6 +212,33 @@ final class SamsungTVClient: NSObject, ObservableObject {
             }
         }
         return false
+    }
+
+    /// The device-info endpoint comes up well before the remote-control
+    /// service has finished loading its paired-device list. If we open the
+    /// socket in that window the TV answers our valid token with
+    /// `ms.channel.unauthorized`. Wait for `PowerState == "on"` (firmwares
+    /// that report it) and then a short grace period.
+    private func waitForBootToSettle(host: String) async {
+        for attempt in 0..<bootPollAttempts {
+            if Task.isCancelled { return }
+            // A failed probe means the TV is momentarily unreachable — keep
+            // waiting. A probe without a PowerState field means this firmware
+            // doesn't report it, so the grace period alone has to do.
+            guard let info = await TVScanner.probe(host: host, timeout: 0.8) else {
+                try? await Task.sleep(nanoseconds: wakePollInterval)
+                continue
+            }
+            let state = info.powerState
+            if state == nil || state?.lowercased() == "on" {
+                DiagnosticLog.shared.log(
+                    "TV reports PowerState=\(state ?? "n/a") after \(attempt + 1) poll(s); settling \(bootGraceNS / 1_000_000_000) s before connecting"
+                )
+                break
+            }
+            try? await Task.sleep(nanoseconds: wakePollInterval)
+        }
+        try? await Task.sleep(nanoseconds: bootGraceNS)
     }
 
     private func scheduleReconnectOrFail(_ message: String) {
@@ -365,29 +416,13 @@ final class SamsungTVClient: NSObject, ObservableObject {
         case "ms.channel.connect":
             status = .connected
             reconnectAttempt = 0
+            unauthorizedWithTokenCount = 0
             startPingLoop()
             flushPending()
             DiagnosticLog.shared.log("Connected. Pending keys queued: \(pendingKeys.count)")
 
         case "ms.channel.unauthorized":
-            // Common cause: the TV rebooted (firmware update, power blip,
-            // deep-standby cycle) and its side of the pairing store was
-            // wiped, so our stored token is no longer recognised. Clear
-            // the token and immediately reconnect without it — the TV will
-            // show one Allow prompt, and after the user accepts the new
-            // token flows in via ms.channel.connect and is saved.
-            if let id = settings.activeTV?.id {
-                settings.forgetPairing(id: id)
-                UserDefaults.standard.synchronize()
-            }
-            DiagnosticLog.shared.log(
-                "ms.channel.unauthorized — token cleared, requesting fresh pair",
-                level: .warn
-            )
-            cancelSocket()
-            pingTask?.cancel()
-            status = .awaitingPairing
-            startConnect()
+            handleUnauthorized()
 
         case "ms.channel.timeOut":
             status = .failed("Pairing timed out. Try Connect again.")
@@ -397,6 +432,70 @@ final class SamsungTVClient: NSObject, ObservableObject {
         default:
             break
         }
+    }
+
+    /// `ms.channel.unauthorized` has three distinct causes and only one of
+    /// them should cost us the stored token:
+    ///
+    /// 1. The TV is still booting (we connected too early after a wake or a
+    ///    power blip) and its remote-control service hasn't loaded the
+    ///    paired-device list yet. The token is fine — retry with it.
+    /// 2. The TV genuinely no longer knows the token (Smart Hub reset,
+    ///    device removed from Device Connection Manager). Clear it and
+    ///    re-pair; the TV shows one Allow prompt.
+    /// 3. The user pressed Deny, so the TV has this device name blocked.
+    ///    Reconnecting without a token won't help — stop and tell them where
+    ///    to unblock it on the TV.
+    ///
+    /// Dropping the token on the first reply (what we used to do) turned
+    /// every case-1 hiccup into a fresh pairing prompt.
+    private func handleUnauthorized() {
+        cancelSocket()
+        pingTask?.cancel()
+
+        guard let tv = settings.activeTV else {
+            status = .failed("TV denied access.")
+            wantsConnection = false
+            return
+        }
+
+        if tv.token != nil, unauthorizedWithTokenCount < maxUnauthorizedRetriesWithToken {
+            unauthorizedWithTokenCount += 1
+            let delayNS = UInt64(unauthorizedWithTokenCount) * 2_000_000_000 // 2 s, 4 s, 6 s
+            DiagnosticLog.shared.log(
+                "ms.channel.unauthorized with stored token (\(unauthorizedWithTokenCount)/\(maxUnauthorizedRetriesWithToken)) — TV may still be booting; retrying with the same token in \(delayNS / 1_000_000_000) s",
+                level: .warn
+            )
+            status = .reconnecting
+            connectTask?.cancel()
+            connectTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: delayNS)
+                await self?.connectAsync()
+            }
+            return
+        }
+
+        if tv.token != nil {
+            settings.forgetPairing(id: tv.id)
+            UserDefaults.standard.synchronize()
+            unauthorizedWithTokenCount = 0
+            DiagnosticLog.shared.log(
+                "ms.channel.unauthorized \(maxUnauthorizedRetriesWithToken)× with stored token — token cleared, requesting fresh pair",
+                level: .warn
+            )
+            status = .awaitingPairing
+            startConnect()
+            return
+        }
+
+        DiagnosticLog.shared.log(
+            "ms.channel.unauthorized without a token — the TV has “\(settings.deviceName)” blocked",
+            level: .warn
+        )
+        status = .failed(
+            "TV denied access. On the TV open Settings ▸ General ▸ External Device Manager ▸ Device Connection Manager ▸ Device List and allow “\(settings.deviceName)”, then tap Connect."
+        )
+        wantsConnection = false
     }
 
     private func normalisedData(from raw: Any?) -> [String: Any]? {

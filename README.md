@@ -81,14 +81,31 @@ On the TV: **Settings ▸ General ▸ Network ▸ Network Status ▸ IP Settings
   protocol and are not supported.
 - **TLS errors** — turn TLS off on the saved TV (via Add TV by IP…) to use
   port 8001; the app already trusts self‑signed certs on 8002.
-- **TV re‑prompts to Allow the remote after every TV reboot** — this is a
-  Samsung Tizen firmware behaviour, not an app bug. The TV stores its
-  paired‑client whitelist in a partition that gets wiped by a cold boot
-  (unplug, firmware update, and on some 2020+ sets a deep‑standby cycle).
-  On reconnect the TV no longer recognises our stored token and shows the
-  pairing prompt exactly once; after you accept, the new token is captured
-  and everything is fine until the next reboot. Two things that reduce how
-  often this happens in practice: pair the TV with Samsung's own
-  **SmartThings** app first (keeps the whitelist "warm"), and update the TV
-  firmware (Settings ▸ Support ▸ Software Update). Between reboots the app
-  reconnects silently.
+- **TV re‑prompts to Allow the remote after every TV reboot** — two things
+  to check, one on the TV and one in the app.
+
+  On the TV, open **Settings ▸ General ▸ External Device Manager ▸ Device
+  Connection Manager** (2022+ sets: **Settings ▸ Connection ▸ External Device
+  Manager**):
+  1. **Access Notification** must be **First Time Only**. On **Always On**
+     the TV asks on every connection by design.
+  2. **Device List** should show the app's device name (default
+     "iPhone Remote") as **Allowed**. If it shows as Denied, or there are
+     several stale entries, delete them and pair once more.
+  3. If the TV is on a smart plug or switched power strip it cold‑boots every
+     time instead of resuming from standby, and some sets only keep paired
+     devices across standby. Let the TV manage its own power and wake it with
+     the app's Wake‑on‑LAN instead.
+  4. Keep the firmware current (**Settings ▸ Support ▸ Software Update**).
+
+  In the app, earlier builds threw the saved token away the first time the TV
+  answered `ms.channel.unauthorized`. The TV sends that briefly while it is
+  still booting (its device‑info endpoint comes up before the remote‑control
+  service has loaded the paired‑device list), so connecting right after a
+  wake turned a valid token into a fresh pairing prompt. The app now waits for
+  the TV to report `PowerState: on` plus a short grace period before opening
+  the socket after a wake, retries an `unauthorized` reply with the same token
+  three times before giving it up, and stops with a pointer to Device List if
+  the TV has blocked the device. If the prompt still appears, open **Settings ▸
+  Connection log** in the app and look for the `unauthorized` lines — they say
+  whether the TV rejected the token or the app never sent one.

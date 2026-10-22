@@ -10,6 +10,9 @@ enum TVScanner {
         var modelName: String?
         var host: String
         var mac: String?
+        /// `device.PowerState` from the device-info endpoint ("on" /
+        /// "standby") on firmwares that report it; nil otherwise.
+        var powerState: String?
     }
 
     /// Quick reachability probe. Returns true iff the host answers the Samsung
@@ -76,6 +79,7 @@ enum TVScanner {
         let wiredMAC = device?["mac"] as? String ?? device?["ethernetMac"] as? String
         let mac = (wifiMAC?.isEmpty == false ? wifiMAC : wiredMAC)?.uppercased()
         let udn = json["id"] as? String
+        let powerState = device?["PowerState"] as? String
         let name = (device?["name"] as? String)
             ?? (json["name"] as? String)
             ?? modelName
@@ -89,7 +93,7 @@ enum TVScanner {
         guard looksLikeSamsung else { return nil }
 
         let id = (mac?.isEmpty == false ? mac! : (udn?.isEmpty == false ? udn! : host))
-        return Result(id: id, name: name, modelName: modelName, host: host, mac: mac)
+        return Result(id: id, name: name, modelName: modelName, host: host, mac: mac, powerState: powerState)
     }
 }
 
