@@ -106,6 +106,11 @@ On the TV: **Settings ▸ General ▸ Network ▸ Network Status ▸ IP Settings
   the TV to report `PowerState: on` plus a short grace period before opening
   the socket after a wake, retries an `unauthorized` reply with the same token
   three times before giving it up, and stops with a pointer to Device List if
-  the TV has blocked the device. If the prompt still appears, open **Settings ▸
-  Connection log** in the app and look for the `unauthorized` lines — they say
-  whether the TV rejected the token or the app never sent one.
+  the TV has blocked the device. Earlier builds also dropped the socket after
+  10 s of silence, so if pressing **Allow** on the TV took longer than that
+  the acceptance went to a connection the app had already closed, and the
+  reconnect prompted again; the socket now stays open for the whole prompt
+  window. If the prompt still appears, open **Settings ▸ Connection log** in
+  the app and look for `Socket died` and `unauthorized` lines — they say
+  whether the app dropped the connection, the TV rejected the token, or the
+  app never sent one.

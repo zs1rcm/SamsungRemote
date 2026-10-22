@@ -42,6 +42,7 @@ final class SamsungTVClient: NSObject, ObservableObject {
     private var reconnectAttempt = 0
     private let maxReconnectAttempts = 5
     private let pingInterval: UInt64 = 20_000_000_000 // 20 s
+    private let socketIdleTimeout: TimeInterval = 90
 
     /// How long we're willing to wait for a WoL'd TV to come back up before
     /// falling back to the subnet scan (or reporting failure).
@@ -66,7 +67,15 @@ final class SamsungTVClient: NSObject, ObservableObject {
         self.settings = settings
         super.init()
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 10
+        // For a WebSocket task this is an *idle* timeout: the task fails
+        // with "The request timed out" if no frame arrives within it. The
+        // TV sends nothing while its Allow prompt is on screen, so a short
+        // value tore the socket down before the user could accept, and the
+        // reconnect opened a fresh socket that prompted again. Keep it
+        // longer than the TV's own prompt window (~30 s, after which it
+        // sends ms.channel.timeOut) and rely on the 20 s ping loop to
+        // detect a dead connection quickly once we are connected.
+        config.timeoutIntervalForRequest = socketIdleTimeout
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }
 
